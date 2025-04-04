@@ -1,0 +1,26 @@
+[package]
+name = "apump_ai"
+version = "1.0.0"
+authors = []
+
+[addresses]
+apump_ai = "0xaabc"
+bonding_curve = "0xaabca"
+admin = "0xaaac"
+zero="0x0"
+
+[dev-addresses]
+apump_ai = "0xaabc"
+bonding_curve = "0xaabca"
+admin = "0xaaac"
+zero="0x0"
+
+[dependencies.AptosFramework]
+git = "https://github.com/aptos-labs/aptos-framework.git"
+rev = "mainnet"
+subdir = "aptos-framework"
+#
+#[dependencies.swap]
+#git = "https://github.com/aptos-labs/aptos-framework.git"
+#rev = "bbf569abd260d94bc30fe96da297d2aecb193644"
+#subdir = "aptos-move/move-examples/swap"
