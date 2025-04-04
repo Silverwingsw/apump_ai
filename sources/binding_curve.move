@@ -1,9 +1,8 @@
 module apump_ai::bonding_curve {
     use std::error;
-    use aptos_framework::event;
     use apump_ai::formula::{calculate_sale_return, calculate_purchase_return};
 
-    const PRECISION: u128 = 1_000_000_000_000_000_000;
+    const PRECISION: u128 = 1_000_000_000;
     const MAX_WEIGHT: u32 = 1000000;
     const SLOPE_SCALE: u128 = 10000;
     const E_ZERO_SUPPLY: u64 = 3;
@@ -24,10 +23,6 @@ module apump_ai::bonding_curve {
 
     fun init_module(account: &signer) {
         move_to(account, Curve {
-            slope: 1000000,
-            reserve_ratio: 50000
-        });
-        event::emit(CurveEvent {
             slope: 1000000,
             reserve_ratio: 50000
         });

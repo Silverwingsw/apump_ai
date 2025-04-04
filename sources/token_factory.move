@@ -5,7 +5,9 @@ module apump_ai::token_factory {
     use std::string;
     use std::string::String;
     use aptos_std::math128;
+    use aptos_std::ordered_map;
     use aptos_std::ordered_map::OrderedMap;
+    use aptos_std::smart_table;
     use aptos_std::table;
     use aptos_std::table::Table;
     use aptos_framework::account;
@@ -13,13 +15,13 @@ module apump_ai::token_factory {
     use aptos_framework::coin;
     use aptos_framework::dispatchable_fungible_asset;
     use aptos_framework::event;
-    use aptos_framework::function_info::FunctionInfo;
+    use aptos_framework::function_info::{FunctionInfo, new_function_info};
     use aptos_framework::fungible_asset;
-    use aptos_framework::fungible_asset::{TransferRef, FungibleAsset, Metadata};
+    use aptos_framework::fungible_asset::{TransferRef, FungibleAsset, Metadata, withdraw};
     use aptos_framework::object;
     use aptos_framework::object::{ExtendRef, Object};
     use aptos_framework::primary_fungible_store;
-    use apump_ai::bonding_curve::{compute_minting_amount_from_price, compute_refund_for_burning};
+    use apump_ai::bonding_curve::{compute_refund_for_burning, compute_minting_amount_from_price};
 
 
     // ERROR CONSTANTS
@@ -93,7 +95,7 @@ module apump_ai::token_factory {
     }
 
     struct TokenRegistry has key {
-        tokens: Table<String, address>,
+        tokens: smart_table::SmartTable<String, address>,
     }
 
     #[resource_group_member(group = aptos_framework::object::ObjectGroup)]
@@ -126,9 +128,9 @@ module apump_ai::token_factory {
     }
 
 
-    fun init_module(owner: &signer) {
-        let (_resource, resource_signer_cap) = account::create_resource_account(owner, b"token_factory_sell");
-        move_to(owner, FinancialData {
+    fun init_module(contract: &signer) {
+        let (_resource, resource_signer_cap) = account::create_resource_account(contract, b"token_factory_sell");
+        move_to(contract, FinancialData {
             fee_percent: 0,
             fee_accumulated: 0,
             fee_withdrawn: 0,
@@ -137,21 +139,51 @@ module apump_ai::token_factory {
             apt_balance: 0,
             resource_signer_cap,
         });
-        move_to(owner, TokenRegistry {
-            tokens: table::new<String, address>()
+        move_to(contract, TokenRegistry {
+            tokens: smart_table::new()
         });
+
+        let seed = b"fa_generator";
+        let constructor_ref = object::create_named_object(contract, seed);
+        let extend_ref = object::generate_extend_ref(&constructor_ref);
+
+        let permissioned_withdraw = new_function_info(
+            contract,
+            string::utf8(b"token_factory"),
+            string::utf8(b"permissioned_withdraw")
+        );
+
+        move_to(contract, TokenFactory {
+            permissioned_withdraw,
+            fa_generator_extend_ref: extend_ref
+        });
+
+        let competition_data = CompetitionData {
+            current_competition_id: 0,
+            tokens_by_competition_id: ordered_map::new(),
+            competition_ids: ordered_map::new(),
+            winners: table::new()
+        };
+        move_to(contract, competition_data);
     }
+
+    #[test_only]
+    public fun init_for_test() {
+        init_module(
+            &account::create_account_for_test(@apump_ai)
+        )
+    }
+
     inline fun in_competition_check(token: address) acquires CompetitionData {
-        let competition_ids = &borrow_global<CompetitionData>(@admin).competition_ids;
-        let current_competition_id = &borrow_global<CompetitionData>(@admin).current_competition_id;
+        let competition_ids = &borrow_global<CompetitionData>(@apump_ai).competition_ids;
+        let current_competition_id = &borrow_global<CompetitionData>(@apump_ai).current_competition_id;
         let competion_id = competition_ids.borrow(&token);
         assert!(competion_id == current_competition_id, ERR_COMPETITION_ID_ENDED);
     }
 
     inline fun only_owner(admin: address) {
-        assert!(admin == @admin, ERR_NOT_ADMIN);
+        assert!(admin == @apump_ai, ERR_NOT_ADMIN);
     }
-
 
     fun create_token_internal(
         name: String,
@@ -187,17 +219,32 @@ module apump_ai::token_factory {
         let burn_ref = fungible_asset::generate_burn_ref(fa_obj_constructor_ref);
         let fa_minted = fungible_asset::mint(&mint_ref, (max_supply as u64));
 
-        dispatchable_fungible_asset::register_dispatch_functions(
-            fa_obj_constructor_ref,
-            option::some(apump.permissioned_withdraw),
-            option::none(),
-            option::none()
-        );
         move_to(&fa_obj_signer, FAController { transfer_ref, mint_ref, burn_ref });
 
         event::emit(FungibleAssetCreated { name, symbol, max_supply, decimals, icon_uri, project_uri });
         (get_fa_obj_address(name, symbol), fa_minted)
     }
+
+    entry fun create_token_entry(
+        signer: &signer,
+        name: String,
+        symbol: String,
+        max_supply: u128,
+        decimals: u8,
+        icon_uri: String,
+        project_uri: String
+    ) acquires TokenFactory, TokenRegistry {
+        create_token(
+            signer,
+            name,
+            symbol,
+            max_supply,
+            decimals,
+            icon_uri,
+            project_uri
+        );
+    }
+
 
     public fun create_token(
         signer: &signer,
@@ -215,36 +262,34 @@ module apump_ai::token_factory {
         let signer_store = primary_fungible_store::ensure_primary_store_exists(signer_addr, metadata_obj);
         fungible_asset::deposit(signer_store, fa_minted);
 
-        let registry = borrow_global_mut<TokenRegistry>(@admin);
+        let registry = borrow_global_mut<TokenRegistry>(@apump_ai);
         let key = string::utf8(b"");
         key.append(name);
         key.append(string::utf8(b"-"));
         key.append(symbol);
         registry.tokens.add(key, address);
-
         address
     }
 
 
-    public fun buy(
+    public entry fun buy(
         buyer: &signer,
         token: address,
         receiver: address,
         payment_amount: u64
-    ): u128 acquires CompetitionData, FinancialData, FAController {
-        let competition_data = borrow_global<CompetitionData>(@admin);
+    ) acquires CompetitionData, FinancialData, FAController {
+        let competition_data = borrow_global<CompetitionData>(@apump_ai);
         let competition_id = competition_data.competition_ids.borrow(&token);
         assert!(*competition_id > 0, ERR_TOKEN_NOT_FOUND);
         assert!(payment_amount > 0, ERR_TOKEN_NOT_FOUND);
 
         let (payment_without_fee, fee): (u64, u64) = get_collateral_amount_and_fee(payment_amount);
-
         let buyer_addr = signer::address_of(buyer);
         let buyer_balance = coin::balance<AptosCoin>(buyer_addr);
         assert!(buyer_balance >= payment_amount, ERR_APT_NOT_ENOUGH);
         let coins = coin::withdraw<AptosCoin>(buyer, payment_amount);
 
-        let financial_data = borrow_global_mut<FinancialData>(@admin);
+        let financial_data = borrow_global_mut<FinancialData>(@apump_ai);
         let resource_signer = account::create_signer_with_capability(&financial_data.resource_signer_cap);
         coin::deposit<AptosCoin>(signer::address_of(&resource_signer), coins);
         financial_data.apt_balance += payment_amount;
@@ -263,16 +308,14 @@ module apump_ai::token_factory {
             fee_amount: fee,
             token
         });
-
-        token_amount
     }
 
-    public fun sell(
+    public entry fun sell(
         seller: &signer,
         token: address,
         amount: u64,
         receiver: address
-    ): u64 acquires FinancialData, FAController, CompetitionData {
+    ) acquires FinancialData, FAController, CompetitionData {
         let seller_addr = signer::address_of(seller);
         let fa_controller = borrow_global<FAController>(token);
         let metadata_obj = object::address_to_object<Metadata>(token);
@@ -280,10 +323,10 @@ module apump_ai::token_factory {
         let balance = primary_fungible_store::balance(seller_addr, metadata_obj);
         assert!(balance >= amount, ERR_APT_NOT_ENOUGH);
 
-        let competition_data = borrow_global<CompetitionData>(@admin);
+        let competition_data = borrow_global<CompetitionData>(@apump_ai);
         let competition_id = *competition_data.competition_ids.borrow(&token);
 
-        let financial_data = borrow_global_mut<FinancialData>(@admin);
+        let financial_data = borrow_global_mut<FinancialData>(@apump_ai);
         let collateral_by_id_data = financial_data.collateral_by_id.borrow(competition_id);
         let collateral = collateral_by_id_data.borrow(token);
         let fa_maximum_supply = fungible_asset::maximum(metadata_obj).extract::<u128>();
@@ -300,25 +343,23 @@ module apump_ai::token_factory {
         assert!(coin_balance >= (payment as u64), ERR_APT_NOT_ENOUGH);
         coin::transfer<AptosCoin>(&resource_signer, receiver, (payment as u64));
         financial_data.apt_balance -= (payment as u64);
-
-        (payment as u64)
     }
 
     public entry fun set_fee_percent(admin: &signer, new_fee_percent: u64) acquires FinancialData {
         only_owner(signer::address_of(admin));
-        let financial_data = borrow_global_mut<FinancialData>(@admin);
+        let financial_data = borrow_global_mut<FinancialData>(@apump_ai);
         financial_data.fee_percent = new_fee_percent;
     }
 
     public entry fun set_required_collateral(admin: &signer, required_collateral: u64) acquires FinancialData {
         only_owner(signer::address_of(admin));
-        let financial_data = borrow_global_mut<FinancialData>(@admin);
+        let financial_data = borrow_global_mut<FinancialData>(@apump_ai);
         financial_data.required_collateral = required_collateral;
     }
 
-    public fun set_new_competition(admin: &signer) acquires CompetitionData {
+    public entry fun set_new_competition(admin: &signer) acquires CompetitionData {
         only_owner(signer::address_of(admin));
-        let competition_data = borrow_global_mut<CompetitionData>(@admin);
+        let competition_data = borrow_global_mut<CompetitionData>(@apump_ai);
         competition_data.current_competition_id += 1;
     }
 
@@ -327,8 +368,8 @@ module apump_ai::token_factory {
         fa_address: address,
         payment_without_fee: u64
     ): u128 acquires CompetitionData, FinancialData {
-        let financial_data = borrow_global<FinancialData>(@admin);
-        let competition_data = borrow_global<CompetitionData>(@admin);
+        let financial_data = borrow_global<FinancialData>(@apump_ai);
+        let competition_data = borrow_global<CompetitionData>(@apump_ai);
         let competition_id = competition_data.competition_ids.borrow(&fa_address);
         let collateral_by_id_data = financial_data.collateral_by_id.borrow(*competition_id);
         let collateral = collateral_by_id_data.borrow(fa_address);
@@ -345,7 +386,7 @@ module apump_ai::token_factory {
     fun get_collateral_amount_and_fee(
         payment_amount: u64,
     ): (u64, u64) acquires FinancialData {
-        let financial_data = borrow_global<FinancialData>(@admin);
+        let financial_data = borrow_global<FinancialData>(@apump_ai);
         let fee = calculate_fee(payment_amount, financial_data.fee_percent);
         let payment_without_fee = payment_amount - fee;
         (payment_without_fee, fee)
@@ -355,8 +396,8 @@ module apump_ai::token_factory {
     public fun get_winner_by_competition_id(competition_id: u64): address acquires CompetitionData, FinancialData {
         let max_collateral: u64 = 0;
         let winner: address = @zero;
-        let competition_data = borrow_global<CompetitionData>(@admin);
-        let financial_data = borrow_global<FinancialData>(@admin);
+        let competition_data = borrow_global<CompetitionData>(@apump_ai);
+        let financial_data = borrow_global<FinancialData>(@apump_ai);
 
         let tokens_by_competition_id_vec = competition_data.tokens_by_competition_id.borrow(&competition_id);
         let collateral_by_id_data = financial_data.collateral_by_id.borrow(competition_id);
@@ -382,7 +423,7 @@ module apump_ai::token_factory {
         let collateral_without_fee: u64 = 0;
         let winner = get_winner_by_competition_id(competition_id);
 
-        let competition_data = borrow_global<CompetitionData>(@admin);
+        let competition_data = borrow_global<CompetitionData>(@apump_ai);
         let tokens_by_competition_id_vec = competition_data.tokens_by_competition_id.borrow(&competition_id);
         let tokens_by_competition_length = tokens_by_competition_id_vec.length();
 
@@ -390,7 +431,7 @@ module apump_ai::token_factory {
         while (i < tokens_by_competition_length) {
             let fa_address = *tokens_by_competition_id_vec.borrow(i);
 
-            let financial_data = borrow_global<FinancialData>(@admin);
+            let financial_data = borrow_global<FinancialData>(@apump_ai);
             let collateral_by_id_data = financial_data.collateral_by_id.borrow(competition_id);
             let collateral = *collateral_by_id_data.borrow(fa_address);
 
@@ -407,7 +448,6 @@ module apump_ai::token_factory {
     }
 
     #[view]
-    /// Get current minted amount by an address
     public fun get_current_minted_amount(
         fa_obj: Object<Metadata>,
         addr: address
@@ -425,8 +465,8 @@ module apump_ai::token_factory {
         name: String,
         symbol: String
     ): address acquires TokenFactory {
-        let launchpad = borrow_global<TokenFactory>(@apump_ai);
-        let fa_generator_address = object::address_from_extend_ref(&launchpad.fa_generator_extend_ref);
+        let token_factory_data = borrow_global<TokenFactory>(@apump_ai);
+        let fa_generator_address = object::address_from_extend_ref(&token_factory_data.fa_generator_extend_ref);
         let fa_key_seed = *name.bytes();
         fa_key_seed.append(b"-");
         fa_key_seed.append(*symbol.bytes());
@@ -447,16 +487,25 @@ module apump_ai::token_factory {
 
     #[view]
     public fun get_apt_balance(): u64 acquires FinancialData {
-        borrow_global<FinancialData>(@admin).apt_balance
+        borrow_global<FinancialData>(@apump_ai).apt_balance
     }
 
     #[view]
     public fun get_required_collateral(): u64 acquires FinancialData {
-        borrow_global<FinancialData>(@admin).required_collateral
+        borrow_global<FinancialData>(@apump_ai).required_collateral
     }
 
     #[view]
     public fun get_current_competition_id(): u64 acquires CompetitionData {
-        borrow_global<CompetitionData>(@admin).current_competition_id
+        borrow_global<CompetitionData>(@apump_ai).current_competition_id
+    }
+
+    #[view]
+    public fun get_fa_collection(): vector<address> acquires TokenRegistry {
+        let vec = vector[];
+        TokenRegistry[@apump_ai].tokens.for_each_ref(|k, v|{
+            vec.push_back(*v);
+        });
+        vec
     }
 }

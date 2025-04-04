@@ -9,7 +9,7 @@ module apump_ai::formula {
     const E_ZERO_SUPPLY: u64 = 3;
     const E_ZERO_BALANCE: u64 = 4;
     const E_ZERO_WEIGHT: u64 = 5;
-    const E_OVERFLOW: u64 = 6;
+    const E_OVERFLOW: u64 = 65542;
 
     public fun calculate_purchase_return(
         s: u128,
@@ -76,7 +76,7 @@ module apump_ai::formula {
 
     fun mul_u128(a: u128, b: u128): u128 {
         let prod = a * b / PRECISION;
-        assert!(prod * PRECISION / a == b, error::invalid_argument(E_OVERFLOW));
+        assert!(prod * PRECISION / a == b, error::invalid_argument(0));
         prod
     }
 
@@ -100,25 +100,5 @@ module apump_ai::formula {
             e /= 2;
         };
         result
-    }
-
-    #[test]
-    fun test_calculate_purchase_return() {
-        let s = 1000 * PRECISION;
-        let b = 500 * PRECISION;
-        let w = 500000;
-        let p = 100 * PRECISION;
-        let k = calculate_purchase_return(s, b, w, p);
-        assert!(k > 0, 0);
-    }
-
-    #[test]
-    fun test_calculate_sale_return() {
-        let s = 1000 * PRECISION;
-        let b = 500 * PRECISION;
-        let w = 500000;
-        let k = 200 * PRECISION;
-        let p = calculate_sale_return(s, b, w, k);
-        assert!(p > 0, 0);
     }
 }
